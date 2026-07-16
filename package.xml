@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<package>
+  <name>SetReferencePointAndRotate</name>
+  <description>选中顶点/直线/圆/面作为参考点，平移到原点并支持旋转调整。方便导出精确坐标的STEP文件。</description>
+  <version>1.0</version>
+  <date>2026-07-16</date>
+  <author>jhgao6337-cmd</author>
+  <maintainer>jhgao6337-cmd</maintainer>
+  <license>LGPL-2.1+</license>
+  <url>https://github.com/jhgao6337-cmd/FreeCAD</url>
+  <content>
+    <workbench>Macro</workbench>
+  </content>
+</package>

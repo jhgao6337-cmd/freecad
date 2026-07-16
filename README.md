@@ -1,4 +1,4 @@
-# 设置参考点并旋转 (SetReferencePointAndRotate)
+# 修改原点坐标
 
 **FreeCAD 宏**
 

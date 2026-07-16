@@ -1,0 +1,233 @@
+# -*- coding: utf-8 -*-
+"""
+SetReferencePointAndRotate.FCMacro
+适用于 FreeCAD 1.1
+
+功能：
+- 选中一个【顶点】 -> 使用该点作为参考点
+- 选中一条【直线】 -> 使用直线的中点作为参考点
+- 选中一段【圆/圆弧】 -> 使用圆心作为参考点
+- 选中一个【面】     -> 使用面的几何中心(质心)作为参考点
+
+运行后：
+1. 该参考点会被显示出坐标 (X, Y, Z)
+2. 整个模型会被平移，使该参考点成为临时的全局原点 (0,0,0)
+3. 弹出一个面板，里面有绕 X / Y / Z 轴旋转的角度输入框
+   —— 因为参考点已经在原点上，所以无论怎么旋转，这个点永远不会动，
+      只有模型的朝向会跟着变化
+4. 面板点"确定"保留结果；点"取消"会撤销本次全部操作(平移+旋转)
+
+使用方法：
+1. 打开 FreeCAD -> 宏 -> 宏对话框 -> 创建新宏，粘贴本文件内容，保存
+   （或者直接把本文件复制到宏目录，重启 FreeCAD 后在宏对话框中选中执行）
+2. 在3D视图中，点选一个顶点 / 一条直线 / 一段圆弧或圆 / 一个面
+3. 运行本宏
+4. 在弹出的面板里调整 X / Y / Z 旋转角度，实时预览
+5. 满意后点"确定"；不满意点"取消"恢复原状
+"""
+
+import FreeCAD as App
+import FreeCADGui as Gui
+from PySide import QtCore, QtGui
+
+
+def get_global_correction(obj):
+    """
+    计算“对象自身Shape坐标” -> “真正世界坐标”所需的额外修正变换。
+
+    obj.Shape 上取到的点，已经包含了 obj.Placement 本身，
+    但如果这个对象是被放在 Body / App::Part / Link 等容器里的，
+    还会有一层“父级/容器”的位置变换没有被计入，直接用 sub.Point 之类
+    的坐标去计算平移量，就会导致算出来的偏移量是错的（表现为模型飞走）。
+
+    修正方法：用 obj.getGlobalPlacement()（真正的世界坐标变换，包含所有父级）
+    除掉 obj.Placement（Shape里已经包含的那一层），剩下的就是需要额外叠加的量。
+    对于没有父级容器的普通顶层对象，这个修正量等于“不变”，不会影响原有结果。
+    """
+    try:
+        global_pl = obj.getGlobalPlacement()
+        local_pl = obj.Placement
+        return global_pl.multiply(local_pl.inverse())
+    except Exception:
+        return App.Placement()  # 出错时不做任何修正，保持原样
+
+
+def get_reference_point(selection):
+    """
+    根据当前选择，判断选中的是点/线/圆/面，返回 (参考点坐标, 类型说明文字)
+    找不到可识别的元素时返回 (None, None)
+    """
+    for sel_obj in selection:
+        obj = sel_obj.Object
+        correction = get_global_correction(obj)
+
+        for i, name in enumerate(sel_obj.SubElementNames):
+            sub = sel_obj.SubObjects[i]
+
+            # 选中的是顶点：优先使用鼠标真实点击的世界坐标（最可靠）
+            if name.startswith("Vertex"):
+                if sel_obj.PickedPoints:
+                    return sel_obj.PickedPoints[0], "点 (Vertex)"
+                point = correction.multVec(sub.Point)
+                return point, "点 (Vertex)"
+
+            # 选中的是边：可能是直线，也可能是圆/圆弧
+            if name.startswith("Edge"):
+                curve = sub.Curve
+                type_name = getattr(curve, "TypeId", str(type(curve)))
+
+                if "Circle" in type_name or "Ellipse" in type_name:
+                    # 圆 / 圆弧 -> 取圆心，并做全局坐标修正
+                    center = correction.multVec(sub.Curve.Center)
+                    return center, "圆/圆弧中心 (Edge-Circle)"
+
+                elif "Line" in type_name:
+                    # 直线 -> 取两端点中点，并做全局坐标修正
+                    p1 = sub.Vertexes[0].Point
+                    p2 = sub.Vertexes[-1].Point
+                    midpoint = correction.multVec((p1 + p2) * 0.5)
+                    return midpoint, "直线中点 (Edge-Line)"
+
+                else:
+                    # 其他曲线类型（比如样条线），退化为质心，同样做坐标修正
+                    point = correction.multVec(sub.CenterOfMass)
+                    return point, "曲线质心 (Edge-Other)"
+
+            # 选中的是面 -> 取面的几何中心（质心），同样做坐标修正
+            if name.startswith("Face"):
+                point = correction.multVec(sub.CenterOfMass)
+                return point, "面中心 (Face)"
+
+    return None, None
+
+
+class RefPointRotateTaskPanel:
+    """
+    交互面板：显示参考点坐标，提供 X/Y/Z 旋转角度输入
+    旋转始终围绕参考点（已被移动到全局原点）进行
+    """
+
+    def __init__(self, ref_point, kind_label, base_placements):
+        self.ref_point = ref_point
+        self.kind_label = kind_label
+        # base_placements: dict { 对象: 平移完成后、旋转开始前的 Placement 副本 }
+        self.base_placements = base_placements
+
+        self.form = QtGui.QWidget()
+        self.form.setWindowTitle(u"设置参考点并旋转")
+        layout = QtGui.QVBoxLayout(self.form)
+
+        info_text = (
+            u"选中类型：%s\n"
+            u"原始坐标：X = %.3f   Y = %.3f   Z = %.3f\n"
+            u"（该点已被设为临时原点 (0,0,0)，下方旋转将始终围绕它进行）"
+            % (kind_label, ref_point.x, ref_point.y, ref_point.z)
+        )
+        info_label = QtGui.QLabel(info_text)
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        grid = QtGui.QGridLayout()
+
+        self.spin_x = QtGui.QDoubleSpinBox()
+        self.spin_y = QtGui.QDoubleSpinBox()
+        self.spin_z = QtGui.QDoubleSpinBox()
+        for spin in (self.spin_x, self.spin_y, self.spin_z):
+            spin.setRange(-360.0, 360.0)
+            spin.setDecimals(2)
+            spin.setSuffix(u" °")
+            spin.valueChanged.connect(self.update_rotation)
+
+        grid.addWidget(QtGui.QLabel(u"绕 X 轴旋转："), 0, 0)
+        grid.addWidget(self.spin_x, 0, 1)
+        grid.addWidget(QtGui.QLabel(u"绕 Y 轴旋转："), 1, 0)
+        grid.addWidget(self.spin_y, 1, 1)
+        grid.addWidget(QtGui.QLabel(u"绕 Z 轴旋转："), 2, 0)
+        grid.addWidget(self.spin_z, 2, 1)
+        layout.addLayout(grid)
+
+        hint = QtGui.QLabel(
+            u"提示：旋转顺序为先绕X、再绕Y、最后绕Z，旋转轴固定通过选中的参考点。"
+            u"调整角度可实时预览方向，点击下方“确定”保留结果，或“取消”撤销全部操作。"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+    def update_rotation(self):
+        rx = self.spin_x.value()
+        ry = self.spin_y.value()
+        rz = self.spin_z.value()
+
+        Rx = App.Rotation(App.Vector(1, 0, 0), rx)
+        Ry = App.Rotation(App.Vector(0, 1, 0), ry)
+        Rz = App.Rotation(App.Vector(0, 0, 1), rz)
+
+        # 组合旋转：先X，再Y，最后Z，均围绕全局原点（也就是参考点）
+        r_total = Rz.multiply(Ry.multiply(Rx))
+        delta_placement = App.Placement(App.Vector(0, 0, 0), r_total)
+
+        for obj, base_pl in self.base_placements.items():
+            obj.Placement = delta_placement.multiply(base_pl)
+
+        App.ActiveDocument.recompute()
+        Gui.updateGui()
+
+    def getStandardButtons(self):
+        return int(QtGui.QDialogButtonBox.Ok | QtGui.QDialogButtonBox.Cancel)
+
+    def accept(self):
+        App.ActiveDocument.commitTransaction()
+        Gui.Control.closeDialog()
+        return True
+
+    def reject(self):
+        App.ActiveDocument.abortTransaction()
+        App.ActiveDocument.recompute()
+        Gui.Control.closeDialog()
+        return True
+
+
+def run():
+    sel = Gui.Selection.getSelectionEx()
+    if not sel:
+        App.Console.PrintError(
+            u"请先在3D视图中选中一个点、一条直线、一段圆弧/圆，或一个面，再运行此宏。\n"
+        )
+        return
+
+    ref_point, kind_label = get_reference_point(sel)
+    if ref_point is None:
+        App.Console.PrintError(
+            u"未能识别选中的几何元素，请选中顶点、边(直线/圆)或面。\n"
+        )
+        return
+
+    doc = App.ActiveDocument
+    if doc is None:
+        App.Console.PrintError(u"当前没有打开的文档。\n")
+        return
+
+    App.Console.PrintMessage(
+        u"选中类型：%s   坐标：X=%.3f  Y=%.3f  Z=%.3f\n"
+        % (kind_label, ref_point.x, ref_point.y, ref_point.z)
+    )
+
+    translation = App.Vector(-ref_point.x, -ref_point.y, -ref_point.z)
+
+    doc.openTransaction(u"Set Reference Point And Rotate")
+
+    base_placements = {}
+    for obj in doc.Objects:
+        # 只处理顶层对象（没有父对象的对象），避免子对象被重复平移/旋转
+        if hasattr(obj, "Placement") and not obj.InList:
+            obj.Placement.Base = obj.Placement.Base + translation
+            base_placements[obj] = App.Placement(obj.Placement)  # 保存平移后的基准姿态
+
+    doc.recompute()
+
+    panel = RefPointRotateTaskPanel(ref_point, kind_label, base_placements)
+    Gui.Control.showDialog(panel)
+
+
+if __name__ == "__main__":
+    run()
